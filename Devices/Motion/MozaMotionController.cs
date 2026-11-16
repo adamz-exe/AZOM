@@ -958,29 +958,50 @@ namespace MozaPlugin.Devices.Motion
             // controller levels it off (Inverse holds the ask within AiHeaveMaxShare); the tick-over
             // pulse is a vibration, not a pose, so it is left out.
             double heaveCap = AiHeaveScaleMm * AiHeaveMaxShare;
-            Volatile.Write(ref _drivenPose, new MotionDrivenPose
+            var driven = new MotionDrivenPose(_aiLimiter.IntendedPitchMm, _aiLimiter.IntendedRollMm,
+                Math.Max(-heaveCap, Math.Min(heaveCap, _aiLimiter.HeaveMm)), halfLength, halfWidth);
+            lock (_drivenPoseLock)
             {
-                PitchTravelMm = _aiLimiter.IntendedPitchMm,
-                RollTravelMm = _aiLimiter.IntendedRollMm,
-                HeaveMm = Math.Max(-heaveCap, Math.Min(heaveCap, _aiLimiter.HeaveMm)),
-                ControllerHalfLengthMm = halfLength,
-                ControllerHalfWidthMm = halfWidth,
-                AtMs = now,
-            });
+                _drivenPose = driven;
+                _drivenPoseAtMs = now;
+            }
         }
 
-        private MotionDrivenPose? _drivenPose;
+        // Written by the lane tick, read by the output's worker thread; the lock only guards the copy.
+        private readonly object _drivenPoseLock = new object();
+        private MotionDrivenPose _drivenPose;
+        private long _drivenPoseAtMs = long.MinValue;
+
+        private void ClearDrivenPose()
+        {
+            lock (_drivenPoseLock) _drivenPoseAtMs = long.MinValue;
+        }
 
         /// <summary>
         /// AI mode only: the pose last driven, if the lane streams AI mode and sent it within
-        /// <paramref name="maxAgeMs"/>; null otherwise (game mode, manual mode, not streaming).
+        /// <paramref name="maxAgeMs"/>; false otherwise (game mode, manual mode, not streaming).
         /// </summary>
-        public MotionDrivenPose? LatestDrivenPose(int maxAgeMs)
+        public bool TryGetDrivenPose(int maxAgeMs, out MotionDrivenPose pose)
         {
-            if (!_aiMode || _phase != MotionLanePhase.Game) return null;
-            var p = Volatile.Read(ref _drivenPose);
-            if (p == null || _clock.ElapsedMilliseconds - p.AtMs > maxAgeMs) return null;
-            return p;
+            pose = default;
+            if (!_aiMode || _phase != MotionLanePhase.Game) return false;
+            long at;
+            lock (_drivenPoseLock)
+            {
+                pose = _drivenPose;
+                at = _drivenPoseAtMs;
+            }
+            return at != long.MinValue && _clock.ElapsedMilliseconds - at <= maxAgeMs;
+        }
+
+        /// <summary>Front-to-rear actuator spacing as read from the controller (mm); null until read or below 100 mm.</summary>
+        public double? RigLengthReadMm
+        {
+            get
+            {
+                float l = Volatile.Read(ref _rigLength);
+                return float.IsNaN(l) || l < 100f ? (double?)null : l;
+            }
         }
 
         private void SilenceVibration()
@@ -1196,7 +1217,7 @@ namespace MozaPlugin.Devices.Motion
             var target = StreamMode;
             // Mode 3 on the way in levels the platform, so the limiter starts from a level pose.
             _aiLimiter.Reset();
-            Volatile.Write(ref _drivenPose, null);
+            ClearDrivenPose();
             Array.Clear(_poseSent, 0, 3);
             _poseLive = false;
             _aiMaxPerformanceApplied = _aiMaxPerformance;
